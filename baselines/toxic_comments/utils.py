@@ -122,13 +122,12 @@ def create_feature_and_label(inputs):
 
 def create_optimizer(
     initial_lr: float,
-    steps_per_epoch: int,
+    num_train_steps: int,
     epochs: int,
     warmup_proportion: float,
     end_lr: float = 0.0,
     optimizer_type: str = 'adamw') -> tf.keras.optimizers.Optimizer:
   """Creates a BERT optimizer with learning rate schedule."""
-  num_train_steps = steps_per_epoch * epochs
   num_warmup_steps = int(num_train_steps * warmup_proportion)
   return optimization.create_optimizer(
       initial_lr,

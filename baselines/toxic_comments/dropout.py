@@ -194,7 +194,6 @@ def main(argv):
       'ood': ood_dataset_builder,
       'ood_identity': ood_identity_dataset_builder,
   }
-  train_dataset = train_dataset_builder.build(split=base.Split.TRAIN)
 
   class_weight = utils.create_class_weight(
       train_dataset_builders, test_dataset_builders)
@@ -203,10 +202,14 @@ def main(argv):
   ds_info = train_dataset_builder.info
   num_classes = ds_info['num_classes']  # Positive and negative classes.
 
-  steps_per_epoch = ds_info['num_train_examples'] // batch_size
   train_datasets = {}
+  steps_per_epoch = {}
+  num_train_steps = 0
   for dataset_name, dataset_builder in train_dataset_builders.items():
     train_datasets[dataset_name] = dataset_builder.build(split=base.Split.TRAIN)
+    steps_per_epoch[dataset_name] = (
+        dataset_builder.info['num_train_examples'] // batch_size)
+    num_train_steps += steps_per_epoch[dataset_name] * FLAGS.train_epochs
 
   test_datasets = {}
   steps_per_eval = {}
@@ -242,7 +245,7 @@ def main(argv):
 
     optimizer = utils.create_optimizer(
         FLAGS.base_learning_rate,
-        steps_per_epoch=steps_per_epoch,
+        num_train_steps=num_train_steps,
         epochs=FLAGS.train_epochs,
         warmup_proportion=FLAGS.warmup_proportion)
 
@@ -264,13 +267,13 @@ def main(argv):
       latest_checkpoint = tf.train.latest_checkpoint(FLAGS.eval_checkpoint_dir)
     else:
       latest_checkpoint = tf.train.latest_checkpoint(FLAGS.output_dir)
-    initial_epoch = 0
+    initial_step = 0
     if latest_checkpoint:
       # checkpoint.restore must be within a strategy.scope() so that optimizer
       # slot variables are mirrored.
       checkpoint.restore(latest_checkpoint)
       logging.info('Loaded checkpoint %s', latest_checkpoint)
-      initial_epoch = optimizer.iterations.numpy() // steps_per_epoch
+      initial_step = optimizer.iterations.numpy()
     elif FLAGS.model_family.lower() == 'bert':
       # load BERT from initial checkpoint
       bert_checkpoint = tf.train.Checkpoint(model=bert_encoder)
@@ -336,7 +339,7 @@ def main(argv):
     return sample_weight
 
   @tf.function
-  def train_step(iterator, dataset_name='wikipedia_toxicity_subtypes'):
+  def train_step(iterator, dataset_name):
     """Training StepFn."""
 
     def step_fn(inputs):
@@ -575,27 +578,31 @@ def main(argv):
 
   else:
     # Execute train / eval loop.
-    train_iterator = iter(train_dataset)  # pytype: disable=wrong-arg-types
     start_time = time.time()
-    for epoch in range(initial_epoch, FLAGS.train_epochs):
+    current_step = 0
+    for epoch in range(FLAGS.train_epochs):
       logging.info('Starting to run epoch: %s', epoch)
+      for dataset_name, train_dataset in train_datasets.items():
+        for step in range(steps_per_epoch[dataset_name]):
+          if current_step + 1 <= initial_step:
+            current_step += 1
+            continue
+          train_iterator = iter(train_dataset)
+          train_step(train_iterator, dataset_name)
 
-      for step in range(steps_per_epoch):
-        train_step(train_iterator)
+          current_step += 1
+          time_elapsed = time.time() - start_time
+          steps_per_sec = float(current_step) / time_elapsed
+          eta_seconds = (num_train_steps - current_step) / steps_per_sec
+          message = ('{:.1%} completion: epoch {:d}/{:d}. {:.1f} steps/s. '
+                     'ETA: {:.0f} min. Time elapsed: {:.0f} min'.format(
+              current_step / num_train_steps, epoch + 1,
+              FLAGS.train_epochs, steps_per_sec, eta_seconds / 60,
+              time_elapsed / 60))
+          if step % 20 == 0:
+            logging.info(message)
 
-        current_step = epoch * steps_per_epoch + (step + 1)
-        max_steps = steps_per_epoch * FLAGS.train_epochs
-        time_elapsed = time.time() - start_time
-        steps_per_sec = float(current_step) / time_elapsed
-        eta_seconds = (max_steps - current_step) / steps_per_sec
-        message = ('{:.1%} completion: epoch {:d}/{:d}. {:.1f} steps/s. '
-                   'ETA: {:.0f} min. Time elapsed: {:.0f} min'.format(
-                       current_step / max_steps, epoch + 1, FLAGS.train_epochs,
-                       steps_per_sec, eta_seconds / 60, time_elapsed / 60))
-        if step % 20 == 0:
-          logging.info(message)
-
-      if epoch % FLAGS.evaluation_interval == 0:
+      if epoch % FLAGS.evaluation_interval == 0 and current_step > initial_step:
         for dataset_name, test_dataset in test_datasets.items():
           test_iterator = iter(test_dataset)  # pytype: disable=wrong-arg-types
           logging.info('Testing on dataset %s', dataset_name)
@@ -631,7 +638,8 @@ def main(argv):
         metric.reset_states()
 
       if (FLAGS.checkpoint_interval > 0 and
-          (epoch + 1) % FLAGS.checkpoint_interval == 0):
+          (epoch + 1) % FLAGS.checkpoint_interval == 0 and
+          current_step > initial_step):
         checkpoint_name = checkpoint.save(
             os.path.join(FLAGS.output_dir, 'checkpoint'))
         logging.info('Saved checkpoint to %s', checkpoint_name)
